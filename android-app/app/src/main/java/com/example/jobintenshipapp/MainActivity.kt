@@ -1,4 +1,3 @@
-
 package com.example.jobintenshipapp
 
 import android.os.Bundle
@@ -14,6 +13,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import org.json.JSONArray
+import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.concurrent.thread
@@ -25,7 +25,10 @@ data class Opportunity(
     val type: String,
     val skills: List<String>,
     val location: String,
-    val description: String
+    val description: String,
+    val matchPercentage: Int? = null,
+    val matchedSkills: List<String> = emptyList(),
+    val missingSkills: List<String> = emptyList()
 )
 
 class MainActivity : AppCompatActivity() {
@@ -35,14 +38,10 @@ class MainActivity : AppCompatActivity() {
 
     private var selectedFilter = "all"
     private var opportunities: List<Opportunity> = emptyList()
+    private var showingRecommendations = false
 
-    private val preferredSkills = setOf(
-        "kotlin", "android", "java",
-        "python", "sql", "machine learning"
-    )
-
-    // Replace this IP if your laptop's Wi-Fi IPv4 address changes.
-    private val apiUrl = "http://10.176.105.95:8000/jobs"
+    // Update this IP if your laptop's Wi-Fi IPv4 address changes.
+    private val baseUrl = "http://10.176.105.95:8000"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -66,32 +65,36 @@ class MainActivity : AppCompatActivity() {
 
         findViewById<Button>(R.id.jobsButton).setOnClickListener {
             selectedFilter = "job"
-            showOpportunities()
+            loadJobs()
+        }
+
+        findViewById<Button>(R.id.profileButton).setOnClickListener {
+            startActivity(
+                android.content.Intent(this, ProfileActivity::class.java)
+            )
         }
 
         findViewById<Button>(R.id.internshipsButton).setOnClickListener {
             selectedFilter = "internship"
-            showOpportunities()
+            loadJobs()
         }
 
-        findViewById<Button>(R.id.recommendationsButton).setOnClickListener {
-            selectedFilter = "recommended"
-            showOpportunities()
-        }
+        // Logout is intentionally not on the home screen.
+        // It remains inside My Profile.
+
+        findViewById<Button>(R.id.recommendationsButton)
+            .setOnClickListener {
+                selectedFilter = "recommended"
+                loadRecommendations()
+            }
 
         searchInput.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(
-                s: CharSequence?,
-                start: Int,
-                count: Int,
-                after: Int
+                s: CharSequence?, start: Int, count: Int, after: Int
             ) = Unit
 
             override fun onTextChanged(
-                s: CharSequence?,
-                start: Int,
-                before: Int,
-                count: Int
+                s: CharSequence?, start: Int, before: Int, count: Int
             ) {
                 showOpportunities()
             }
@@ -104,76 +107,136 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadJobs() {
+        showingRecommendations = false
+        opportunitiesText.text = "Loading opportunities..."
+
+        fetchData(
+            endpoint = "/jobs",
+            tokenRequired = false
+        ) { response ->
+            val array = JSONArray(response)
+            val fetched = mutableListOf<Opportunity>()
+
+            for (i in 0 until array.length()) {
+                val item = array.getJSONObject(i)
+                fetched.add(parseOpportunity(item, false))
+            }
+
+            opportunities = fetched
+            showOpportunities()
+        }
+    }
+
+    private fun loadRecommendations() {
+        showingRecommendations = true
+        opportunitiesText.text = "Loading personalized recommendations..."
+
+        val token = getSharedPreferences(
+            "CareerConnect", MODE_PRIVATE
+        ).getString("access_token", null)
+
+        if (token.isNullOrBlank()) {
+            opportunitiesText.text =
+                "Please log in to see your recommendations."
+
+            Toast.makeText(
+                this,
+                "Your login session is missing. Please log in again.",
+                Toast.LENGTH_LONG
+            ).show()
+
+            startActivity(
+                android.content.Intent(this, LoginActivity::class.java)
+            )
+            finish()
+            return
+        }
+
+        fetchData(
+            endpoint = "/recommendations",
+            tokenRequired = true,
+            token = token
+        ) { response ->
+            val array = JSONArray(response)
+            val fetched = mutableListOf<Opportunity>()
+
+            for (i in 0 until array.length()) {
+                val item = array.getJSONObject(i)
+                fetched.add(parseOpportunity(item, true))
+            }
+
+            opportunities = fetched
+            showOpportunities()
+        }
+    }
+
+    private fun fetchData(
+        endpoint: String,
+        tokenRequired: Boolean,
+        token: String? = null,
+        onSuccess: (String) -> Unit
+    ) {
         thread {
             var connection: HttpURLConnection? = null
 
             try {
-                connection =
-                    (URL(apiUrl).openConnection() as HttpURLConnection).apply {
+                connection = (
+                        URL("$baseUrl$endpoint").openConnection()
+                                as HttpURLConnection
+                        ).apply {
                         requestMethod = "GET"
                         connectTimeout = 10000
-                        readTimeout = 10000
+                        readTimeout = 15000
                         setRequestProperty("Accept", "application/json")
+
+                        if (tokenRequired && !token.isNullOrBlank()) {
+                            setRequestProperty(
+                                "Authorization", "Bearer $token"
+                            )
+                        }
                     }
 
                 val status = connection.responseCode
 
-                if (status !in 200..299) {
-                    throw Exception("Server returned HTTP $status")
+                val stream = if (status in 200..299) {
+                    connection.inputStream
+                } else {
+                    connection.errorStream
                 }
 
-                val response = connection.inputStream
-                    .bufferedReader()
-                    .use { it.readText() }
+                val response = stream?.bufferedReader()
+                    ?.use { it.readText() }.orEmpty()
 
-                val jsonArray = JSONArray(response)
-                val fetchedJobs = mutableListOf<Opportunity>()
-
-                for (i in 0 until jsonArray.length()) {
-                    val item = jsonArray.getJSONObject(i)
-
-                    val skillsJson =
-                        item.optJSONArray("required_skills") ?: JSONArray()
-
-                    val skills = (0 until skillsJson.length()).map { index ->
-                        skillsJson.optString(index)
+                if (status !in 200..299) {
+                    val message = try {
+                        JSONObject(response).optString(
+                            "detail", "Server returned HTTP $status"
+                        )
+                    } catch (_: Exception) {
+                        "Server returned HTTP $status"
                     }
 
-                    fetchedJobs.add(
-                        Opportunity(
-                            id = item.optString("id"),
-                            title = item.optString(
-                                "title", "Untitled opportunity"
-                            ),
-                            company = item.optString(
-                                "company", "Unknown company"
-                            ),
-                            type = item.optString("job_type", "Job"),
-                            skills = skills,
-                            location = item.optString(
-                                "location", "Not specified"
-                            ),
-                            description = item.optString("eligibility", "")
-                        )
-                    )
+                    throw Exception(message)
                 }
 
                 runOnUiThread {
-                    opportunities = fetchedJobs
-                    showOpportunities()
+                    try {
+                        onSuccess(response)
+                    } catch (e: Exception) {
+                        opportunitiesText.text =
+                            "Unable to read server response: ${e.message}"
+                    }
                 }
-
             } catch (e: Exception) {
                 runOnUiThread {
                     opportunitiesText.text =
-                        "Unable to load opportunities.\n\n" +
-                                "Check that your laptop and phone are connected " +
-                                "and the backend is running.\n\n" +
+                        "Unable to load data.\n\n" +
+                                "Check your network and make sure the backend is running.\n\n" +
                                 "Error: ${e.message}"
 
                     Toast.makeText(
                         this,
-                        "Could not connect to the jobs server",
+                        "Could not load data from the server",
                         Toast.LENGTH_LONG
                     ).show()
                 }
@@ -183,11 +246,62 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun parseOpportunity(
+        item: JSONObject,
+        isRecommendation: Boolean
+    ): Opportunity {
+        val skills = readStringArray(
+            item.optJSONArray("required_skills")
+        )
+
+        return Opportunity(
+            id = item.optString(
+                if (isRecommendation) "job_id" else "id"
+            ),
+            title = item.optString("title", "Untitled opportunity"),
+            company = item.optString("company", "Unknown company"),
+            type = item.optString("job_type", "Job"),
+            skills = skills,
+            location = item.optString("location", "Not specified"),
+            description = item.optString("eligibility", ""),
+            matchPercentage = if (isRecommendation) {
+                if (
+                    item.has("match_percentage") &&
+                    !item.isNull("match_percentage")
+                ) {
+                    item.optInt("match_percentage")
+                } else {
+                    null
+                }
+            } else {
+                null
+            },
+            matchedSkills = if (isRecommendation) {
+                readStringArray(item.optJSONArray("matched_skills"))
+            } else {
+                emptyList()
+            },
+            missingSkills = if (isRecommendation) {
+                readStringArray(item.optJSONArray("missing_skills"))
+            } else {
+                emptyList()
+            }
+        )
+    }
+
+    private fun readStringArray(array: JSONArray?): List<String> {
+        if (array == null) return emptyList()
+
+        return (0 until array.length()).mapNotNull { index ->
+            val value = array.optString(index, "").trim()
+            value.takeIf { it.isNotEmpty() && it != "null" }
+        }
+    }
+
     private fun showOpportunities() {
         val query = searchInput.text.toString().trim()
 
-        var results = opportunities.filter { opportunity ->
-
+        val results = opportunities.filter { opportunity ->
             val matchesType = when (selectedFilter) {
                 "job" -> !opportunity.type.contains(
                     "internship", ignoreCase = true
@@ -206,28 +320,17 @@ class MainActivity : AppCompatActivity() {
                 opportunity.type,
                 opportunity.location,
                 opportunity.skills.joinToString(" "),
-                opportunity.description
+                opportunity.description,
+                opportunity.matchedSkills.joinToString(" "),
+                opportunity.missingSkills.joinToString(" ")
             )
 
             val matchesSearch = query.isBlank() ||
                     searchableFields.any { field ->
-                        field.trim().contains(
-                            query.trim(),
-                            ignoreCase = true
-                        )
+                        field.contains(query, ignoreCase = true)
                     }
 
             matchesType && matchesSearch
-        }
-
-        if (selectedFilter == "recommended") {
-            results = results.sortedByDescending { opportunity ->
-                opportunity.skills.count { skill ->
-                    preferredSkills.any { preferred ->
-                        skill.equals(preferred, ignoreCase = true)
-                    }
-                }
-            }
         }
 
         opportunitiesText.text = buildString {
@@ -235,24 +338,53 @@ class MainActivity : AppCompatActivity() {
                 when (selectedFilter) {
                     "job" -> "AVAILABLE JOBS"
                     "internship" -> "AVAILABLE INTERNSHIPS"
-                    "recommended" -> "RECOMMENDED FOR YOU"
+                    "recommended" -> "PERSONALIZED RECOMMENDATIONS"
                     else -> "ALL OPPORTUNITIES"
                 }
             )
-
             appendLine()
 
             if (results.isEmpty()) {
-                append("No matching opportunities found.")
+                append(
+                    if (
+                        selectedFilter == "recommended" &&
+                        query.isBlank()
+                    ) {
+                        "No recommendations found. Check that your candidate profile " +
+                                "has been saved and that jobs exist in the database."
+                    } else {
+                        "No matching opportunities found."
+                    }
+                )
             } else {
                 results.forEachIndexed { index, opportunity ->
                     appendLine("${index + 1}. ${opportunity.title}")
                     appendLine("Company: ${opportunity.company}")
                     appendLine("Type: ${opportunity.type}")
                     appendLine("Location: ${opportunity.location}")
-                    appendLine(
-                        "Skills: ${opportunity.skills.joinToString(", ")}"
-                    )
+                    appendLine("Skills: ${opportunity.skills.joinToString(", ")}")
+
+                    if (showingRecommendations) {
+                        opportunity.matchPercentage?.let {
+                            appendLine("Match: $it%")
+                        }
+
+                        appendLine(
+                            "Matched skills: ${
+                                opportunity.matchedSkills
+                                    .joinToString(", ")
+                                    .ifBlank { "None listed" }
+                            }"
+                        )
+
+                        appendLine(
+                            "Missing skills: ${
+                                opportunity.missingSkills
+                                    .joinToString(", ")
+                                    .ifBlank { "None listed" }
+                            }"
+                        )
+                    }
 
                     if (opportunity.description.isNotBlank()) {
                         appendLine(
