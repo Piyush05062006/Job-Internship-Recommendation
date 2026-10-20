@@ -17,3 +17,8 @@ profiles_collection = db["profiles"]
 jobs_collection = db["jobs"]
 applications_collection = db["applications"]
 notifications_collection = db["notifications"]
+try:
+    client.admin.command("ping")
+    print("MongoDB Atlas connection successful!")
+except Exception as e:
+    print("MongoDB connection failed:", type(e).__name__, str(e))
